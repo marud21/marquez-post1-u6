@@ -206,3 +206,76 @@ Además de esta tabla, las 13 pruebas verifican en ambas versiones:
 - el inventario descontado;
 - las filas de `detalle_pedido`;
 - que un pedido rechazado no envía correo.
+
+### Parte 2 — Diagnóstico del crecimiento (antes de corregir)
+
+> Las líneas citadas corresponden al commit `4f09508`
+> (`feat: agregar 3 campanas de descuento como eslabones de la cadena de validacion`).
+
+Mercadeo pidió tres campañas: BLACK_FRIDAY (25 % fijo), CORPORATIVO (10 % con NIT) y VOLUMEN (12 % con
+más de 20 unidades). Se implementaron como `PromocionBlackFriday`, `PromocionCorporativo` y
+`PromocionVolumen`, que **extienden `ValidadorPedido`**, y se engancharon a la cadena existente
+(`GestorPedidos.java:44`):
+
+```java
+stock.encadenar(cliente).encadenar(blackFriday).encadenar(corporativo).encadenar(volumen);
+```
+
+**Antipatrón identificado: Golden Hammer.** Ya no es God Object ni Spaghetti Code: no hay una clase
+que concentre todo ni anidamiento profundo. Lo que pasó es que se aplicó la herramienta que "ya
+funcionó" en la Parte 1 a un problema que **no tiene la forma de una cadena**.
+
+#### Evidencia 1 — No hay dependencia de orden entre las campañas
+Las tres llaman a `contexto.aplicarDescuentoCampana(valor)` (`PromocionBlackFriday.java:16`,
+`PromocionCorporativo.java:17`, `PromocionVolumen.java:12`). Ese método se queda con el máximo
+(`ContextoPedido.java:28-30`):
+
+```java
+public void aplicarDescuentoCampana(double valor) {
+    if (valor > this.descuentoCampana) this.descuentoCampana = valor; // el mayor descuento gana
+}
+```
+
+`max` es conmutativo, así que **cualquier permutación** de los tres eslabones produce el mismo
+descuento. Con los validadores pasa lo contrario: el orden es parte de la regla. Un pedido del
+cliente 99 (inexistente) que pide 5 unidades del producto 3 (stock 2) se rechaza con
+*"Stock insuficiente: producto 3"* porque `ValidadorStock` va primero. Si se invierte el orden, el
+motivo cambia a *"Cliente no registrado"*. La cadena existe para modelar esa dependencia, y las
+campañas no la tienen.
+
+#### Evidencia 2 — Ninguna campaña usa la capacidad que justifica la cadena
+`contexto.rechazar(...)` aparece solo en `ValidadorStock.java:26,33` y `ValidadorCliente.java:30,40`.
+Las tres promociones **nunca rechazan** (el propio código lo dice en `PromocionBlackFriday.java:18`:
+*"nunca rechaza -- este eslabon no valida nada"*), así que nunca usan el corte anticipado. Su contrato
+real ("calcular un porcentaje") es el de `EstrategiaDescuento`, no el de `ValidadorPedido` ("decidir
+si el pedido continúa o se rechaza"). Que una clase llamada *Validador* contenga cosas que no validan
+es una violación de Liskov: no se pueden sustituir por un validador real sin cambiar el significado
+de la cadena.
+
+#### Evidencia 3 — La posición en la cadena importa por razones accidentales
+Las promociones solo funcionan **si quedan después** de los validadores:
+- Si `PromocionCorporativo` se pusiera antes de `ValidadorCliente`, un cliente inexistente haría
+  fallar su `jdbcTemplate.queryForObject` (línea 14) con `EmptyResultDataAccessException`, en vez de
+  rechazarse con *"Cliente no registrado"*.
+- La cadena se ejecuta **antes** de calcular el subtotal (`GestorPedidos.java:57`, frente a las
+  líneas 62–63), así que
+  `contexto.getSubtotal()` vale `0` en todos los eslabones. Por eso `PromocionVolumen` recalcula las
+  unidades desde el request (su comentario lo admite), y una campaña futura basada en el monto
+  ("10 % si el subtotal supera $2.000.000") **no podría implementarse** como eslabón sin mover el
+  cálculo de precio dentro de la validación.
+
+#### Evidencia 4 — La regla de combinación quedó partida y oculta
+La decisión "gana el mayor descuento" quedó dividida entre dos clases que no se conocen:
+- `ContextoPedido.aplicarDescuentoCampana` (línea 29) toma el máximo **entre campañas**;
+- `GestorPedidos.java:66` toma el máximo **entre ese valor y el del tipo de cliente**.
+
+Si mercadeo pide que las campañas **se sumen**, habría que modificar el *contexto de validación*, y
+la cadena no permite expresar "estas dos se suman y esta compite" sin ambigüedad. El estado mutable
+compartido (`descuentoCampana`, línea 14) hace que el resultado dependa de que nadie más escriba ese
+campo.
+
+#### Evidencia 5 — La elección no se evaluó
+No hay ningún criterio del problema que lleve a la cadena. El constructor de `GestorPedidos` pasó de
+2 a 5 eslabones (línea 44) solo porque `encadenar()` ya existía. Las tres campañas tienen exactamente
+la forma de `DescuentoVip` y `DescuentoFrecuente`: calculan un porcentaje a partir del pedido o del
+cliente, sin orden y sin corte. La herramienta correcta **ya estaba en el proyecto** y no se usó.
