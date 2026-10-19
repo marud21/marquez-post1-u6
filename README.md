@@ -112,7 +112,7 @@ después de refactorizar.
 ### Parte 1 — Refactorización aplicada
 
 `GestorPedidos` (106 líneas en un método) se dividió en cuatro capas cohesivas. `procesarPedido()`
-quedó en ~20 líneas que solo coordinan:
+quedó en ~25 líneas que solo coordinan:
 
 ```
 GestorPedidos (orquestador, @Transactional)
@@ -143,6 +143,13 @@ tiene un único motivo de rechazo.
 predicado booleano no puede **escribir en el contexto**. `ValidadorCliente` necesita guardar el
 `tipoCliente` que después usa el Strategy, y con una lista de predicados habría que volver a
 consultarlo.
+
+*Corrección sobre el código de referencia de la guía:* allí se escribe
+`this.primerValidador = stock.encadenar(cliente);`. Como `encadenar()` devuelve el **siguiente**
+eslabón, eso deja a `ValidadorCliente` como primer eslabón y `ValidadorStock` **nunca se ejecuta**.
+Aquí la cadena se arma con `stock.encadenar(cliente)` y se guarda `primerValidador = stock`. La
+prueba `stockInsuficienteSeRechazaSinTocarElInventario` habría detectado el error, porque con la
+versión de la guía ese pedido se confirmaba.
 
 #### Decisión 2 — Descuento con Strategy, no como otro eslabón de la cadena
 Las reglas de descuento **no dependen de un orden ni necesitan cortar el flujo**: siempre se aplica
