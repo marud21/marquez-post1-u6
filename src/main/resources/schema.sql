@@ -1,3 +1,12 @@
+-- Reentrante: cada contexto de Spring (p. ej. pruebas con propiedades distintas) que
+-- comparte la base en memoria la reinicia con los datos semilla.
+DROP TABLE IF EXISTS detalle_pedido;
+DROP TABLE IF EXISTS pedidos;
+DROP TABLE IF EXISTS facturas;
+DROP TABLE IF EXISTS clientes;
+DROP TABLE IF EXISTS inventario;
+DROP TABLE IF EXISTS productos;
+
 CREATE TABLE productos (
     id      BIGINT PRIMARY KEY,
     nombre  VARCHAR(100) NOT NULL,
@@ -12,7 +21,8 @@ CREATE TABLE inventario (
 CREATE TABLE clientes (
     id           BIGINT PRIMARY KEY,
     nombre       VARCHAR(100) NOT NULL,
-    tipo_cliente VARCHAR(20) NOT NULL
+    tipo_cliente VARCHAR(20) NOT NULL,
+    nit          VARCHAR(20)               -- solo clientes corporativos
 );
 
 CREATE TABLE facturas (

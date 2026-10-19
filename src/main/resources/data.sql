@@ -19,6 +19,9 @@ INSERT INTO clientes (id, nombre, tipo_cliente) VALUES
     (4, 'Jorge Mendoza',   'MOROSO'),      -- deuda pendiente de $150.000
     (5, 'Laura Gómez',     'ESTANDAR');
 
+INSERT INTO clientes (id, nombre, tipo_cliente, nit) VALUES
+    (6, 'Soluciones Andinas S.A.S.', 'ESTANDAR', '900123456-7');   -- cliente corporativo
+
 INSERT INTO facturas (cliente_id, monto, pagada) VALUES
     (4, 150000, FALSE),
     (4,  50000, TRUE),
