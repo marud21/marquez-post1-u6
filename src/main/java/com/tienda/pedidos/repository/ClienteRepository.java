@@ -29,6 +29,12 @@ public class ClienteRepository {
         return deuda == null ? 0 : deuda;
     }
 
+    /** NIT registrado del cliente; vacío si no es corporativo o no existe. */
+    public Optional<String> nitDe(Long clienteId) {
+        return jdbcTemplate.queryForList("SELECT nit FROM clientes WHERE id = ?", String.class, clienteId)
+                .stream().filter(nit -> nit != null && !nit.isBlank()).findFirst();
+    }
+
     public int pedidosPrevios(Long clienteId) {
         Integer cantidad = jdbcTemplate.queryForObject(
                 "SELECT COUNT(*) FROM pedidos WHERE cliente_id = ?", Integer.class, clienteId);
