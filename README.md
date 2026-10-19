@@ -8,8 +8,49 @@ corrección de un segundo antipatrón introducido al hacer crecer el mismo proye
 
 ## Cómo ejecutar
 ```
-$ mvn spring-boot:run
-$ mvn test
+$ mvn spring-boot:run      # API en http://localhost:8080, consola H2 en /h2-console
+$ mvn test                 # 25 pedidos de prueba (13 de la Parte 1 + 12 de campañas)
+```
+Ejemplo de pedido (cliente VIP con más de $1.000.000 → 15 %):
+```
+curl -X POST http://localhost:8080/api/pedidos -H "Content-Type: application/json" \
+  -d '{"clienteId":1,"clienteEmail":"valentina@tienda.co","items":[{"productoId":2,"cantidad":5}]}'
+```
+Responde 201 con `{"confirmado":true,"pedidoId":...,"total":1264375.0}` o 422 con el motivo de rechazo.
+Los datos semilla (`src/main/resources/data.sql`) incluyen un cliente por cada ruta:
+
+| id | Cliente | Tipo | Para probar |
+|---|---|---|---|
+| 1 | Valentina Rojas | VIP | 5 % / 10 % / 15 % según el subtotal |
+| 2 | Andrés Pérez | FRECUENTE | 11 pedidos previos → 8 % |
+| 3 | Camila Duarte | FRECUENTE | 5 pedidos previos → 4 % |
+| 4 | Jorge Mendoza | MOROSO | deuda de $150.000: rechazo antes de las 20:00 |
+| 5 | Laura Gómez | ESTANDAR | sin descuento |
+| 6 | Soluciones Andinas S.A.S. | ESTANDAR con NIT | campaña CORPORATIVO |
+
+El producto 3 tiene stock 2 (stock insuficiente) y el producto 4 cuesta $1.000 (campaña VOLUMEN con
+más de 20 unidades). BLACK_FRIDAY se activa con `promo.black-friday.activa=true` en
+`application.properties`.
+
+## Estructura final
+```
+src/main/java/com/tienda/pedidos/
+├── controller/PedidoController          POST /api/pedidos
+├── dto/                                 PedidoRequest, ItemPedido, ResultadoPedido
+├── service/
+│   ├── GestorPedidos                    orquestador delgado (@Transactional)
+│   ├── NotificacionPedidoService        arma y envía el correo
+│   └── EmailService / EmailServiceConsola
+├── validacion/        Chain of Responsibility
+│   ├── ValidadorPedido                  eslabón abstracto (corte anticipado)
+│   ├── ValidadorStock ─► ValidadorCliente
+│   └── ContextoPedido
+├── descuento/         Strategy
+│   ├── EstrategiaDescuento              DescuentoVip, DescuentoFrecuente, DescuentoEstandar
+│   ├── SelectorEstrategiaDescuento      elige UNA por tipo de cliente
+│   ├── CampanaDescuento                 DescuentoBlackFriday, DescuentoCorporativo, DescuentoVolumen
+│   └── CalculadorDescuentoFinal         max(tipo de cliente, mejor campaña)
+└── repository/        PedidoRepository, InventarioRepository, ClienteRepository, ProductoRepository
 ```
 
 ## Decisiones de diseño
@@ -279,3 +320,104 @@ No hay ningún criterio del problema que lleve a la cadena. El constructor de `G
 2 a 5 eslabones (línea 44) solo porque `encadenar()` ya existía. Las tres campañas tienen exactamente
 la forma de `DescuentoVip` y `DescuentoFrecuente`: calculan un porcentaje a partir del pedido o del
 cliente, sin orden y sin corte. La herramienta correcta **ya estaba en el proyecto** y no se usó.
+
+### Parte 2 — Corrección aplicada
+
+- Se **eliminaron** `PromocionBlackFriday`, `PromocionCorporativo`, `PromocionVolumen` y el campo
+  `descuentoCampana` de `ContextoPedido`. `ValidadorPedido` vuelve a tener solo los dos eslabones que
+  justifican la cadena: `ValidadorStock → ValidadorCliente`.
+- Las campañas pasan a ser estrategias: `DescuentoBlackFriday`, `DescuentoCorporativo` y
+  `DescuentoVolumen` implementan `CampanaDescuento`, que extiende `EstrategiaDescuento`.
+  `DescuentoCorporativo` consulta el NIT a través de `ClienteRepository.nitDe()`, sin SQL embebido.
+- `CalculadorDescuentoFinal` es el **único** lugar con la regla de combinación: el mayor entre la
+  estrategia del tipo de cliente y la mejor campaña. Se ejecuta después de la validación y con el
+  subtotal ya calculado, así que una campaña por monto ya es posible. `GestorPedidos` solo llama a
+  `calculadorDescuento.calcular(contexto)`.
+
+#### Decisión 5 — Strategy en vez de más eslabones de cadena
+Las tres campañas calculan un porcentaje sin depender del orden de evaluación y sin necesitar cortar
+el flujo del pedido. Esa es exactamente la forma de `EstrategiaDescuento`, no la de
+`ValidadorPedido`. Se diferencian de las estrategias por tipo de cliente en un solo punto: de las
+primeras se elige **una** (`SelectorEstrategiaDescuento`) y de las campañas se evalúan **todas**. Por
+eso se separaron con la interfaz `CampanaDescuento`.
+
+*Alternativa descartada: dejarlas en la cadena.* Es la causa del antipatrón diagnosticado. Reutiliza
+una herramienta por familiaridad sin verificar que el problema tenga su forma, y deja las cinco
+evidencias de arriba.
+
+*Alternativa descartada: registrarlas en el mapa de `SelectorEstrategiaDescuento`.* El selector
+devuelve una sola estrategia por tipo de cliente. Un cliente VIP con más de 20 unidades necesita
+evaluar **a la vez** su estrategia VIP y la de volumen, y eso no cabe en un mapa `tipo → estrategia`.
+
+*Ajuste frente a la guía:* la guía inyecta las tres campañas concretas en el constructor de
+`CalculadorDescuentoFinal`. Aquí se inyecta `List<CampanaDescuento>`, así que una cuarta campaña es
+solo un `@Component` nuevo, sin modificar el calculador (abierto/cerrado).
+
+#### Decisión 6 — Eliminar, no comentar, el código descartado
+Las tres clases y el campo se borraron (`git rm`), no se comentaron. Dejarlas "por si acaso" es
+como nace un **Lava Flow**: nadie se atreve a borrarlas después porque ya no está claro si cumplen
+alguna función. El historial queda en Git: la versión con eslabones está en los commits `4f09508` y
+`dd73546`, y su eliminación en `98390e9`.
+
+#### Comparación antes / después de la corrección
+Las 25 pruebas se ejecutaron **sin cambios** sobre la versión Golden Hammer (commit `dd73546`) y
+sobre la corregida (commit `98390e9`). `git diff --no-index` entre las salidas de ambas versiones no
+reporta diferencias en ninguno de los tres archivos (`salida-pedidos.txt`, `salida-campanas.txt` y
+`salida-black-friday.txt`).
+
+```
+=== Black Friday inactiva (promo.black-friday.activa=false) ===
+C1 CORPORATIVO (NIT)                     | CONFIRMADO | descuento=10%  | total=214200.0
+C2 VOLUMEN 25 unidades (ESTANDAR)        | CONFIRMADO | descuento=12%  | total=26180.0
+C3 VOLUMEN 20 unidades (limite)          | CONFIRMADO | descuento=0%   | total=23800.0
+C4 VIP 5% vs VOLUMEN 12%                 | CONFIRMADO | descuento=12%  | total=21991.2
+C5 VIP 15% vs VOLUMEN 12%                | CONFIRMADO | descuento=15%  | total=1285616.5
+C6 CORPORATIVO 10% vs VOLUMEN 12%        | CONFIRMADO | descuento=12%  | total=31416.0
+C7 Black Friday inactiva (ESTANDAR)      | CONFIRMADO | descuento=0%   | total=119000.0
+C8 VOLUMEN con stock insuficiente        | RECHAZADO  | Stock insuficiente: producto 3
+
+=== Black Friday activa (promo.black-friday.activa=true) ===
+B1 Black Friday (ESTANDAR)               | CONFIRMADO | descuento=25%  | total=178500.0
+B2 Black Friday vs VIP 15%               | CONFIRMADO | descuento=25%  | total=1115625.0
+B3 Black Friday vs CORPORATIVO + VOLUMEN | CONFIRMADO | descuento=25%  | total=26775.0
+B4 Black Friday con cliente inexistente  | RECHAZADO  | Cliente no registrado
+```
+
+Los 13 pedidos de la Parte 1 también producen la misma salida que el `GestorPedidos` original del
+commit `772c2f3`. El comportamiento observable se conservó a lo largo de las cuatro versiones:
+original, refactorizada, Golden Hammer y corregida.
+
+## Historial de commits
+| Parte | Commit | Paso del proceso |
+|---|---|---|
+| 1 | `772c2f3` | Código de partida: todo en `procesarPedido()` |
+| 1 | `986a824` | Pruebas de caracterización (línea base) |
+| 1 | `72ea5fc` | Diagnóstico de God Object + Spaghetti Code |
+| 1 | `428bdcb` | Validaciones → Chain of Responsibility, descuentos → Strategy |
+| 1 | `dc2d0b5` | `GestorPedidos` como orquestador; se eliminan los parches de infraestructura |
+| 1 | `b2665d0`, `580b2b7` | Justificación de decisiones y comparación antes/después |
+| 2 | `4f09508` | Campañas agregadas como eslabones de la cadena (Golden Hammer) |
+| 2 | `dd73546` | Pruebas de caracterización de las campañas |
+| 2 | `eb72e1d` | Diagnóstico de Golden Hammer |
+| 2 | `98390e9` | Campañas → `EstrategiaDescuento`; eslabones eliminados |
+
+## Herramientas utilizadas
+- Java 17, Spring Boot 3.2, Spring JDBC (`JdbcTemplate`), H2 Database, Maven
+- JUnit 5 y Mockito (`mockStatic` para fijar la hora del día en las pruebas)
+- VS Code, Git, GitHub
+
+## Conclusiones
+Diagnosticar antes de refactorizar cambió el resultado. Al citar líneas concretas apareció que el
+anidamiento más profundo no estaba en el descuento sino en la regla de mora. Ejecutar el código de
+partida, en vez de solo leerlo, destapó problemas que su diseño escondía: `CALL IDENTITY()` sin
+transacción, `null` donde JdbcTemplate lanza excepción, y un reloj imposible de controlar.
+
+La prueba de caracterización, escrita contra la API pública antes de tocar nada, fue lo que hizo
+seguros los refactors. El mismo archivo pasó sobre cuatro versiones del código, y además habría
+detectado el error de encadenamiento del código de referencia de la guía.
+
+La Parte 2 mostró que un patrón bien aplicado no es una solución reutilizable por sí misma. Chain of
+Responsibility era correcta para validaciones con orden y corte, y se volvió un Golden Hammer cuando
+se usó para descuentos que no tenían ninguna de esas dos propiedades. La pregunta que distinguió
+ambos casos no fue "¿qué patrón conozco?", sino "¿importa el orden y alguien debe poder detener el
+flujo?".
