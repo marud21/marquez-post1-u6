@@ -108,3 +108,94 @@ código. Cubre 13 pedidos:
 
 La prueba usa solo la API pública `procesarPedido()`, así que el mismo archivo se ejecuta sin cambios
 después de refactorizar.
+
+### Parte 1 — Refactorización aplicada
+
+`GestorPedidos` (106 líneas en un método) se dividió en cuatro capas cohesivas. `procesarPedido()`
+quedó en ~20 líneas que solo coordinan:
+
+```
+GestorPedidos (orquestador, @Transactional)
+ ├─ validacion/  Chain of Responsibility   ValidadorStock ──► ValidadorCliente
+ ├─ descuento/   Strategy                  SelectorEstrategiaDescuento ─► DescuentoVip | DescuentoFrecuente | DescuentoEstandar
+ ├─ repository/  persistencia              PedidoRepository, InventarioRepository, ClienteRepository, ProductoRepository
+ └─ service/     notificación              NotificacionPedidoService ─► EmailService
+```
+
+| Responsabilidad original (líneas) | Ahora vive en |
+|---|---|
+| Items y stock (32–44) | `validacion/ValidadorStock` + `InventarioRepository.stockDe` |
+| Cliente y mora (47–65) | `validacion/ValidadorCliente` + `ClienteRepository` |
+| Subtotal (68–73) | `GestorPedidos.calcularSubtotal` + `ProductoRepository.precioDe` |
+| Descuento (76–93) | `descuento/` — una clase por tipo de cliente, elegida por `SelectorEstrategiaDescuento` |
+| Persistencia (99–113) | `repository/PedidoRepository.guardar` (transaccional) |
+| Notificación (116–129) | `service/NotificacionPedidoService` |
+
+#### Decisión 1 — Validaciones con Chain of Responsibility
+Las validaciones tienen una **dependencia real de orden y de corte anticipado**. Si
+`ValidadorStock` rechaza, `ValidadorCliente` no debe ejecutarse ni consultar la mora. El código
+original lo expresaba con `return` intercalados (líneas 34, 42, 51 y 60). En la cadena,
+`ValidadorPedido.validar()` solo delega al siguiente si el contexto no fue rechazado, y cada eslabón
+tiene un único motivo de rechazo.
+
+*Alternativa descartada:* un método `validarTodo()` que recorra una
+`List<Predicate<ContextoPedido>>`. Evalúa todos los predicados aunque el primero haya fallado, y un
+predicado booleano no puede **escribir en el contexto**. `ValidadorCliente` necesita guardar el
+`tipoCliente` que después usa el Strategy, y con una lista de predicados habría que volver a
+consultarlo.
+
+#### Decisión 2 — Descuento con Strategy, no como otro eslabón de la cadena
+Las reglas de descuento **no dependen de un orden ni necesitan cortar el flujo**: siempre se aplica
+exactamente una, según el tipo de cliente. El `if/else` anidado de las líneas 77–93 se reemplaza por
+un `Map` en `SelectorEstrategiaDescuento` (Strategy + Factory simple), con un único punto de
+decisión. MOROSO y ESTANDAR, que antes caían en un `else` implícito, ahora usan `DescuentoEstandar`
+de forma explícita. Agregar un tipo `EMPLEADO` es crear una clase y registrarla en el mapa, sin abrir
+`GestorPedidos`.
+
+*Alternativa descartada:* modelar cada descuento como un eslabón más de la cadena. Habría obligado
+a inventar un mecanismo para que solo un eslabón fijara el descuento (por ejemplo, "no sobrescribir
+si ya hay uno"). Además mezcla dos contratos distintos: "¿el pedido continúa?" y "¿qué porcentaje
+aplica?".
+
+#### Decisión 3 — El SQL vive en repositorios, no en validadores ni estrategias
+La guía de referencia dejaba `jdbcTemplate.queryForObject(...)` dentro de `ValidadorStock`,
+`ValidadorCliente` y `DescuentoFrecuente`. Así cada clase nueva repetiría, en pequeño, la Evidencia 3:
+SQL y regla de negocio en la misma línea. Por eso las consultas se aislaron en `repository/`, con
+métodos que expresan intención (`stockDe`, `tipoDe`, `deudaPendiente`, `pedidosPrevios`,
+`precioDe`) y devuelven `Optional` cuando el dato puede no existir. Con eso dejaron de hacer falta
+los dos parches que exigía el código original, y ambos se eliminaron:
+- el adaptador `JdbcTemplateNuloSiVacio`;
+- el modo `LEGACY` de H2.
+
+#### Decisión 4 — Persistencia transaccional con id generado
+`PedidoRepository.guardar()` es `@Transactional` y obtiene el id con `KeyHolder` desde el propio
+`INSERT`, en lugar de `CALL IDENTITY()`. `GestorPedidos.procesarPedido()` también es
+`@Transactional`, así que la validación de stock y el descuento de inventario ocurren en la misma
+transacción. Si falla un item a mitad del bucle, el pedido no queda guardado a medias.
+
+#### Comparación antes / después
+La salida de `GestorPedidosTest` se escribe en `target/salida-pedidos.txt`. Se ejecutó el **mismo
+archivo de prueba** sobre el código original (commit `986a824`) y sobre el refactorizado (commit
+`dc2d0b5`). `git diff --no-index` entre ambas salidas no reporta diferencias:
+
+```
+01 sin items                             | RECHAZADO  | El pedido no contiene items
+02 stock insuficiente                    | RECHAZADO  | Stock insuficiente: producto 3
+03 cliente inexistente                   | RECHAZADO  | Cliente no registrado
+04 moroso 10:00 (dentro del corte)       | RECHAZADO  | Cliente con deuda pendiente: $150000.0
+05 moroso 21:30 (fuera del corte)        | CONFIRMADO | descuento=0%   | total=238000.0
+06 VIP > 1.000.000                       | CONFIRMADO | descuento=15%  | total=1264375.0
+07 VIP 500.000 - 1.000.000               | CONFIRMADO | descuento=10%  | total=642600.0
+08 VIP <= 500.000                        | CONFIRMADO | descuento=5%   | total=226100.0
+09 FRECUENTE > 10 pedidos                | CONFIRMADO | descuento=8%   | total=328440.0
+10 FRECUENTE 4 - 10 pedidos              | CONFIRMADO | descuento=4%   | total=125664.0
+11 ESTANDAR                              | CONFIRMADO | descuento=0%   | total=297500.0
+12 efectos (VIP, 2 productos)            | CONFIRMADO | descuento=10%  | total=696150.0
+13 correo sin descuento (ESTANDAR)       | CONFIRMADO | descuento=0%   | total=119000.0
+```
+
+Además de esta tabla, las 13 pruebas verifican en ambas versiones:
+- el texto exacto del correo;
+- el inventario descontado;
+- las filas de `detalle_pedido`;
+- que un pedido rechazado no envía correo.
